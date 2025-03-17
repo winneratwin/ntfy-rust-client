@@ -13,5 +13,6 @@ The goal is to support the same configuration file as the ntfy client, and to su
 
 ```bash
 git clone https://github.com/winneratwin/ntfy-rust-client.git
+cd ntfy-rust-client
 cargo run --release
 ```
