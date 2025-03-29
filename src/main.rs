@@ -78,10 +78,11 @@ struct ServerConnection {
     filters: Option<Filters>,
     topics: Vec<String>,
     topic_script_map: std::collections::HashMap<String, PathBuf>,
+    retry_count: u8,
 }
 
 impl ServerConnection {
-    fn connect(&self) {
+    fn connect(mut self) {
         let topic = self.topics.join(",");
         let url = self.wss_url(topic.as_str());
 
@@ -114,6 +115,21 @@ impl ServerConnection {
                     _ => {
                         debug!("Unhandled error: {:?}", err);
                     }
+                }
+                // retry connection if error 3 times (race condition in v.User() on the server side
+                // sometimes causes an error which is caught as a generic error which the server
+                // determines to be "unauthenticated" and closes the connection)
+                // github issue: https://github.com/binwiederhier/ntfy/issues/1051
+                // faulty code: https://github.com/binwiederhier/ntfy/blob/630f2957deb670dcacfe0a338091d7561f176b9c/server/server.go#L1905-L1910
+                // this is a workaround for now, but should be fixed in the server code
+
+                if self.retry_count < 3 {
+                    self.retry_count += 1;
+                    info!("Retrying: {}", self.retry_count);
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    self.connect();
+                } else {
+                    error!("Failed to connect to server after 3 attempts");
                 }
 
                 return;
@@ -331,6 +347,7 @@ impl NtfyClient {
                 }
                 None => std::collections::HashMap::new(),
             },
+            retry_count: 0,
         };
         self.subscriptions.push(new_sub);
     }
