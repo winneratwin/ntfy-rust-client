@@ -1,11 +1,16 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use tungstenite::http::Uri;
-use tungstenite::{ClientRequestBuilder, connect};
 
+use futures_util::StreamExt;
 use log::{debug, error, info};
+use tokio::time::timeout;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::ClientRequestBuilder;
+use tokio_tungstenite::tungstenite::http::Uri;
 
 #[derive(PartialEq, Clone, Debug)]
 enum Auth {
@@ -82,7 +87,7 @@ struct ServerConnection {
 }
 
 impl ServerConnection {
-    fn connect(mut self) {
+    async fn connect(mut self) {
         let topic = self.topics.join(",");
         let url = self.wss_url(topic.as_str());
 
@@ -97,7 +102,7 @@ impl ServerConnection {
             None => ClientRequestBuilder::new(url),
         };
 
-        let (mut socket, response) = match connect(client) {
+        let (socket, response) = match connect_async(client).await {
             Ok((socket, response)) => (socket, response),
             Err(err) => {
                 error!("Failed to connect to server: {}", err);
@@ -127,7 +132,7 @@ impl ServerConnection {
                     self.retry_count += 1;
                     info!("Retrying: {}", self.retry_count);
                     std::thread::sleep(std::time::Duration::from_secs(5));
-                    self.connect();
+                    Box::pin(self.connect()).await;
                 } else {
                     error!("Failed to connect to server after 3 attempts");
                 }
@@ -136,54 +141,109 @@ impl ServerConnection {
             }
         };
 
+        let (_write, mut read) = socket.split();
+        // set retry count to 0
+        self.retry_count = 0;
+
         info!("Connected to server");
         debug!("Response HTTP code: {}", response.status());
         debug!("Response HTTP headers: {:#?}", response.headers());
 
         loop {
-            let msg = socket.read().expect("failed to read message");
+            let default_heartbeat = 45;
+            let msg = timeout(Duration::from_secs(default_heartbeat + 10), read.next()).await;
             match msg {
-                tungstenite::Message::Text(text) => {
-                    // json load the message
-                    let msg: serde_json::Value = serde_json::from_str(&text)
-                        .expect(format!("failed to parse message json: {}", text).as_str());
-
-                    // check if the message is an open event
-                    if msg["event"].as_str().unwrap_or("") == "open" {
-                        // check if the topic is the same as the one we subscribed to
-                        if msg["topic"].as_str().unwrap_or("") == topic {
-                            debug!("Connected to correct topic");
-                        } else {
-                            todo!("handle open event for different topic then requested");
-                        }
-                    }
-
-                    // check if message is a message event
-                    // if it is, parse the message for the topic
-                    // if the topic has a script, execute the script with the message
-                    // otherwise check if there is a default script to execute
-                    // if there is no default script, print the message
-
-                    if msg["event"].as_str().unwrap_or("") == "message" {
-                        let topic = msg["topic"].as_str().unwrap_or("");
-                        if let Some(script) = self.topic_script_map.get(topic) {
-                            let script = script.clone();
-                            std::thread::spawn(move || {
-                                execute_script(&script, &msg);
-                            });
-                        } else {
-                            // current version of ntfy returns a newline at the end of the message
-                            // so we don't need to add a newline
-                            print!("{}", msg["message"].as_str().unwrap_or(""));
-                        }
-                    }
-                }
-                tungstenite::Message::Close(close) => {
-                    println!("Received close message: {:?}", close);
+                //timed out
+                Err(_elapsed) => {
+                    // reconnect
+                    error!("Connection timed out");
+                    Box::pin(self.connect()).await;
                     break;
                 }
-                _ => {
-                    debug!("Received unhandled message: {:?}", msg);
+                //read returned none
+                Ok(None) => {}
+
+                Ok(Some(msg)) => {
+                    match msg {
+                        Ok(msg) => {
+                            match msg {
+                                tungstenite::Message::Text(text) => {
+                                    // json load the message
+                                    let msg: serde_json::Value = serde_json::from_str(&text)
+                                        .expect(
+                                            format!("failed to parse message json: {}", text)
+                                                .as_str(),
+                                        );
+
+                                    // check if the message is an open event
+                                    if msg["event"].as_str().unwrap_or("") == "open" {
+                                        // check if the topic is the same as the one we subscribed to
+                                        if msg["topic"].as_str().unwrap_or("") == topic {
+                                            debug!("Connected to correct topic");
+                                        } else {
+                                            todo!(
+                                                "handle open event for different topic then requested"
+                                            );
+                                        }
+                                    }
+
+                                    // check if message is a message event
+                                    // if it is, parse the message for the topic
+                                    // if the topic has a script, execute the script with the message
+                                    // otherwise check if there is a default script to execute
+                                    // if there is no default script, print the message
+
+                                    if msg["event"].as_str().unwrap_or("") == "message" {
+                                        let topic = msg["topic"].as_str().unwrap_or("");
+                                        if let Some(script) = self.topic_script_map.get(topic) {
+                                            let script = script.clone();
+                                            std::thread::spawn(move || {
+                                                execute_script(&script, &msg);
+                                            });
+                                        } else {
+                                            // current version of ntfy returns a newline at the end of the message
+                                            // so we don't need to add a newline
+                                            print!("{}", msg["message"].as_str().unwrap_or(""));
+                                        }
+                                    }
+                                }
+                                tungstenite::Message::Close(close) => {
+                                    println!("Received close message: {:?}", close);
+                                    break;
+                                }
+                                _ => {
+                                    debug!("Received unhandled message: {:?}", msg);
+                                }
+                            }
+                        }
+                        Err(error) => match error {
+                            tungstenite::error::Error::ConnectionClosed => {
+                                error!("Connection closed: {:?}", error);
+                                // retry connection
+                                Box::pin(self.connect()).await;
+                                break;
+                            }
+                            tungstenite::error::Error::AlreadyClosed => {
+                                error!("Connection is closed and we tried to use it: {:?}", error);
+                                Box::pin(self.connect()).await;
+                                break;
+                            }
+                            tungstenite::error::Error::Protocol(perr) => {
+                                match perr {
+                                tungstenite::error::ProtocolError::ResetWithoutClosingHandshake => {
+                                    error!("Connection reset no handshake: {:?}", perr);
+                                    // retry connection
+                                    Box::pin(self.connect()).await;
+                                    break;
+                                }
+                                _ => {
+                                    error!("unhandled protocol error: {}", perr)
+                                }
+                            }
+                            }
+                            _ => error!("Error: {:?}", error),
+                        },
+                    }
                 }
             }
         }
@@ -353,7 +413,8 @@ impl NtfyClient {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // load ntfy config file
@@ -414,12 +475,12 @@ fn main() {
     // handle messages
     let mut threads = vec![];
     for x in client.subscriptions {
-        threads.push(std::thread::spawn(move || {
-            x.connect();
+        threads.push(std::thread::spawn(async move || {
+            x.connect().await;
         }));
     }
     for thread in threads {
-        thread.join().unwrap();
+        thread.join().unwrap().await;
     }
 }
 
@@ -441,19 +502,8 @@ fn execute_script(path: &PathBuf, msg: &serde_json::Value) {
         return;
     }
 
-    // set env vars for script cloning the following go code using the body of the message:
-    // env := make([]string, 0)
-    // env = append(env, envVar(m.ID, "NTFY_ID", "id")...)
-    // env = append(env, envVar(m.Topic, "NTFY_TOPIC", "topic")...)
-    // env = append(env, envVar(fmt.Sprintf("%d", m.Time), "NTFY_TIME", "time")...)
-    // env = append(env, envVar(m.Message, "NTFY_MESSAGE", "message", "m")...)
-    // env = append(env, envVar(m.Title, "NTFY_TITLE", "title", "t")...)
-    // env = append(env, envVar(fmt.Sprintf("%d", m.Priority), "NTFY_PRIORITY", "priority", "prio", "p")...)
-    // env = append(env, envVar(strings.Join(m.Tags, ","), "NTFY_TAGS", "tags", "tag", "ta")...)
-    // env = append(env, envVar(m.Raw, "NTFY_RAW", "raw")...)
-
-    // initialize non string values outside to prevent temporary allocation
-    // errors
+    // initialize non string values outside to prevent temporary variable
+    // allocation errors
 
     let time = msg["time"].as_i64().unwrap_or(0).to_string();
     let priority = msg["priority"].as_i64().unwrap_or(3).to_string();
