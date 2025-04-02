@@ -1,11 +1,10 @@
-use std::path::PathBuf;
-use std::time::Duration;
-
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-
 use futures_util::StreamExt;
 use log::{debug, error, info};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Duration;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite;
@@ -203,7 +202,8 @@ impl ServerConnection {
                                         } else {
                                             // current version of ntfy returns a newline at the end of the message
                                             // so we don't need to add a newline
-                                            print!("{}", msg["message"].as_str().unwrap_or(""));
+                                            print!("{}", msg);
+                                            std::io::stdout().flush().unwrap();
                                         }
                                     }
                                 }
@@ -390,6 +390,13 @@ impl NtfyClient {
         for sub in subscriptions.iter_mut() {
             if sub.auth == auth && sub.server == server && sub.filters == filters {
                 sub.topics.push(topic.to_string());
+                match command {
+                    Some(command) => {
+                        sub.topic_script_map
+                            .insert(topic.to_string(), PathBuf::from(command));
+                    }
+                    None => {}
+                }
                 return;
             }
         }
